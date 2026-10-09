@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="ar">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Face State Tracker v2</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0e0f12; color: #e8e8ea; font: 14px system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #stage { position: relative; flex: 1; min-height: 0; background: #000; overflow: hidden; }
+  #v, #c { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #v { transform: scaleX(-1); }
+  #panel { position: absolute; left: 12px; top: 12px; width: 180px; border: 4px solid #1fd655; background: #f5f5f5; }
+  #panel.alert { border-color: #ff3b3b; }
+  #pimg { display: block; width: 100%; aspect-ratio: 1; object-fit: cover; background: #f5f5f5; }
+  #plabel { padding: 6px 8px; font: 700 13px ui-monospace, monospace; background: #cfcfcf; color: #1fa84a; }
+  #panel.alert #plabel { color: #d62020; }
+  #wear { position: absolute; right: 12px; top: 12px; min-width: 190px; max-width: 46%; padding: 10px 12px; border-radius: 8px;
+          background: rgba(10,12,16,.78); border: 1px solid #2f3340; font-size: 15px; line-height: 1.7; }
+  #wear .row { display: flex; justify-content: space-between; gap: 14px; }
+  #wear .k { color: #9a9ca6; }
+  #wear .on { color: #1fd655; font-weight: 700; }
+  #wear .off { color: #7a7d88; }
+  #toast { position: absolute; left: 50%; bottom: 22px; transform: translateX(-50%); padding: 12px 22px; border-radius: 10px;
+           background: rgba(31,214,85,.92); color: #04210e; font: 700 22px system-ui, sans-serif; opacity: 0; transition: opacity .25s; pointer-events: none; text-align: center; }
+  #toast.show { opacity: 1; }
+  #bar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding: 10px 16px; background: #17181c; }
+  button, label.btn { background: #2b2d34; color: inherit; border: 1px solid #44464f; border-radius: 6px; padding: 9px 14px; font: inherit; cursor: pointer; }
+  #info { margin-left: auto; font: 12px ui-monospace, monospace; color: #9a9ca6; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <video id="v" playsinline muted></video>
+  <canvas id="c"></canvas>
+  <div id="panel"><img id="pimg" alt=""><div id="plabel">STATE: NORMAL</div></div>
+  <div id="wear" dir="rtl"></div>
+  <div id="toast" dir="rtl"></div>
+</div>
+<div id="bar">
+  <button id="start">Start camera</button>
+  <label class="btn" for="files">Load images</label>
+  <input id="files" type="file" accept="image/*" multiple>
+  <button id="voice">Voice: on</button>
+  <span id="info">Images: normal, shocked, smile, thinking, eyes_closed, looking_away, glasses, hat</span>
+</div>
+
+<script type="module">
+import { FaceLandmarker, HandLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+import { pipeline, env }
+  from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2";
+
+/* ====================== editable labels ====================== */
+const GLASSES_AR = "نضبوط";   // change this word if you want another name for glasses
+const HAT_AR = "طاقية";
+
+const CLOTHES = [
+  { q: "a person wearing a t-shirt",                 ar: "تيشيرت",     en: "t-shirt" },
+  { q: "a person wearing a sleeveless tank top",     ar: "فنيلة",      en: "tank top" },
+  { q: "a person wearing a hoodie",                  ar: "هودي",       en: "hoodie" },
+  { q: "a person wearing a jacket or coat",          ar: "جاكيت",      en: "jacket" },
+  { q: "a person wearing a suit and tie",            ar: "بدلة",       en: "suit" },
+  { q: "a person wearing a sweater",                 ar: "كنزة",       en: "sweater" },
+  { q: "a person wearing a button-up dress shirt",   ar: "قميص",       en: "shirt" },
+  { q: "a person wearing a long traditional white robe, thobe", ar: "ثوب", en: "thobe" },
+  { q: "a person wearing a polo shirt",              ar: "بولو",       en: "polo" },
+  { q: "a shirtless person with bare skin",          ar: "بدون ملابس", en: "shirtless" },
+];
+
+const STATES = {
+  normal:       ["NORMAL", false],
+  glasses:      ["GLASSES", false],
+  hat:          ["HAT", false],
+  smile:        ["SMILE", false],
+  thinking:     ["THINKING", false],
+  eyes_closed:  ["EYES CLOSED", true],
+  looking_away: ["LOOKING AWAY", true],
+  shocked:      ["SHOCKED", true],
+};
+
+/* ====================== dom + helpers ====================== */
+const $ = id => document.getElementById(id);
+const video = $("v"), canvas = $("c"), ctx = canvas.getContext("2d", { willReadFrequently: true });
+const panel = $("panel"), pimg = $("pimg"), plabel = $("plabel"), info = $("info"), wearEl = $("wear"), toastEl = $("toast");
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+/* ====================== reaction images ====================== */
+const images = {};
+function card(label) {
+  const c = document.createElement("canvas"); c.width = c.height = 300;
+  const g = c.getContext("2d");
+  g.fillStyle = "#f5f5f5"; g.fillRect(0, 0, 300, 300);
+  g.fillStyle = "#444"; g.font = "bold 28px sans-serif"; g.textAlign = "center";
+  g.fillText(label, 150, 160);
+  return c.toDataURL();
+}
+let shownKey = "";
+function showState(key) {
+  if (key === shownKey) return;
+  shownKey = key;
+  const [label, alert] = STATES[key];
+  pimg.src = images[key] || card(label);
+  plabel.textContent = "STATE: " + label;
+  panel.classList.toggle("alert", alert);
+}
+$("files").addEventListener("change", e => {
+  for (const f of e.target.files) {
+    const key = f.name.replace(/\.[^.]+$/, "").toLowerCase();
+    if (STATES[key]) images[key] = URL.createObjectURL(f);
+  }
+  shownKey = ""; showState(finalKey);
+});
+
+/* ====================== voice + toast ====================== */
+let voiceOn = true, lastSpeak = 0, toastTimer;
+$("voice").onclick = () => { voiceOn = !voiceOn; $("voice").textContent = "Voice: " + (voiceOn ? "on" : "off"); speechSynthesis.cancel(); };
+function say(text) {
+  toastEl.textContent = text; toastEl.classList.add("show");
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove("show"), 2800);
+  if (!voiceOn || !("speechSynthesis" in window)) return;
+  speechSynthesis.cancel();
+  const u = new SpeechSynthesisUtterance(text);
+  u.lang = "ar-SA"; u.rate = 0.95;
+  speechSynthesis.speak(u);
+}
+
+/* ====================== colour name from pixels ====================== */
+function colorName(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+  const s = d === 0 ? 0 : d / (1 - Math.abs(2 * l - 1));
+  let h = 0;
+  if (d) {
+    if (mx === r) h = ((g - b) / d) % 6; else if (mx === g) h = (b - r) / d + 2; else h = (r - g) / d + 4;
+    h = (h * 60 + 360) % 360;
+  }
+  if (l < 0.16) return ["أسود", "black"];
+  if (l > 0.82 && s < 0.3) return ["أبيض", "white"];
+  if (s < 0.14) return l > 0.55 ? ["رمادي فاتح", "light gray"] : ["رمادي", "gray"];
+  if (h >= 10 && h < 45 && l < 0.38) return ["بني", "brown"];
+  if (h < 15 || h >= 345) return ["أحمر", "red"];
+  if (h < 40) return ["برتقالي", "orange"];
+  if (h < 65) return ["أصفر", "yellow"];
+  if (h < 165) return ["أخضر", "green"];
+  if (h < 200) return ["سماوي", "cyan"];
+  if (h < 260) return ["أزرق", "blue"];
+  if (h < 300) return ["بنفسجي", "purple"];
+  return ["زهري", "pink"];
+}
+
+/* ====================== face geometry ====================== */
+function bboxOf(L, w, h) {
+  let x0 = 1, y0 = 1, x1 = 0, y1 = 0;
+  for (const p of L) { if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x; if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y; }
+  return { x0: x0 * w, y0: y0 * h, x1: x1 * w, y1: y1 * h };
+}
+function headPose(m) {
+  const R = (r, c) => m[c * 4 + r];
+  const sy = Math.hypot(R(0, 0), R(1, 0)), d = 180 / Math.PI;
+  return { pitch: Math.atan2(R(2, 1), R(2, 2)) * d, yaw: Math.atan2(-R(2, 0), sy) * d, roll: Math.atan2(R(1, 0), R(0, 0)) * d, R };
+}
+const eyeRatio = (P, t, b, a, c) => dist(P[t], P[b]) / (dist(P[a], P[c]) + 1e-6);
+
+function classifyFace(P, hands, yaw) {
+  const faceW = dist(P[234], P[454]) + 1e-6, faceH = dist(P[10], P[152]) + 1e-6;
+  const mouthOpen = dist(P[13], P[14]) / faceH, mouthW = dist(P[61], P[291]) / faceW;
+  const ear = (eyeRatio(P, 159, 145, 33, 133) + eyeRatio(P, 386, 374, 362, 263)) / 2;
+  let handNear = false;
+  for (const hnd of hands) for (const t of [4, 8, 12])
+    if (Math.min(dist(hnd[t], P[152]), dist(hnd[t], P[13])) < 0.35 * faceH) handNear = true;
+  if (Math.abs(yaw) > 30) return "looking_away";
+  if (mouthOpen > 0.12) return "shocked";
+  if (handNear) return "thinking";
+  if (ear < 0.12) return "eyes_closed";
+  if (mouthW > 0.42 && mouthOpen < 0.08) return "smile";
+  return "normal";
+}
+
+/* ====================== accessory + clothes detection (CLIP) ====================== */
+let clf = null;
+const wear = { glasses: false, hat: false, cloth: null, color: null };
+let finalKey = "normal";
+let latest = null;   // { P, fw, fh } in video pixels of the tracked face
+
+function renderWear() {
+  const row = (k, v, on) => `<div class="row"><span class="k">${k}</span><span class="${on ? "on" : "off"}">${v}</span></div>`;
+  wearEl.innerHTML =
+    row(GLASSES_AR, wear.glasses ? "✔ لابس" : "✘", wear.glasses) +
+    row(HAT_AR, wear.hat ? "✔ لابس" : "✘", wear.hat) +
+    row("الملابس", wear.cloth ? `${wear.cloth.ar} ${wear.color ? wear.color[0] : ""}` : "…", !!wear.cloth);
+}
+
+class Stable {              // value changes only after n identical readings in a row
+  constructor(n, init) { this.n = n; this.val = init; this.cand = init; this.cnt = 0; }
+  push(v) {
+    this.cnt = v === this.cand ? this.cnt + 1 : 1; this.cand = v;
+    if (this.cnt >= this.n && v !== this.val) { this.val = v; return true; }
+    return false;
+  }
+}
+const sGlasses = new Stable(2, false), sHat = new Stable(2, false), sCloth = new Stable(2, null);
+
+const vidCanvas = document.createElement("canvas"), vctx = vidCanvas.getContext("2d", { willReadFrequently: true });
+function crop(x, y, w, h, size = 224) {
+  const W = video.videoWidth, H = video.videoHeight;
+  x = Math.max(0, x); y = Math.max(0, y); w = Math.min(W - x, w); h = Math.min(H - y, h);
+  if (w < 24 || h < 24) return null;
+  vidCanvas.width = size; vidCanvas.height = Math.max(24, Math.round(size * h / w));
+  vctx.drawImage(video, x, y, w, h, 0, 0, vidCanvas.width, vidCanvas.height);
+  return vidCanvas.toDataURL("image/jpeg", 0.85);
+}
+function avgColor(dataUrl) {
+  return new Promise(res => {
+    const im = new Image();
+    im.onload = () => {
+      const c = document.createElement("canvas"); c.width = c.height = 16;
+      const g = c.getContext("2d"); g.drawImage(im, im.width * .25, im.height * .2, im.width * .5, im.height * .6, 0, 0, 16, 16);
+      const d = g.getImageData(0, 0, 16, 16).data; let r = 0, gg = 0, b = 0, n = 0;
+      for (let i = 0; i < d.length; i += 4) { r += d[i]; gg += d[i + 1]; b += d[i + 2]; n++; }
+      res(colorName(r / n, gg / n, b / n));
+    };
+    im.src = dataUrl;
+  });
+}
+async function ask(url, labels) {
+  const out = await clf(url, labels, { hypothesis_template: "{}" });
+  out.sort((a, b) => b.score - a.score);
+  return { top: labels.indexOf(out[0].label), score: out[0].score };
+}
+
+const G_LABELS = ["a close-up photo of eyes wearing eyeglasses", "a close-up photo of eyes wearing sunglasses", "a close-up photo of bare eyes without any glasses"];
+const H_LABELS = ["a photo of a head wearing a hat, cap or beanie", "a photo of a bare head with hair and no hat"];
+
+async function accessoryLoop() {
+  while (running) {
+    if (!clf || !latest) { await sleep(400); continue; }
+    try {
+      const { P, fw, fh } = latest;
+      // glasses: eye band
+      const ex = Math.min(P[33].x, P[263].x), ew = Math.abs(P[263].x - P[33].x);
+      const ey = (P[159].y + P[386].y) / 2;
+      const gUrl = crop(ex - ew * 0.3, ey - ew * 0.3, ew * 1.6, ew * 0.7);
+      if (gUrl) {
+        const r = await ask(gUrl, G_LABELS);
+        const on = r.top <= 1 && r.score > 0.5;
+        if (sGlasses.push(on)) {
+          wear.glasses = on;
+          say(on ? `لابس ${GLASSES_AR}` : `شلت ${GLASSES_AR}`);
+        }
+      }
+      // hat: head box including space above forehead
+      const hUrl = crop(P[10].x - fw * 0.75, P[10].y - fh * 0.85, fw * 1.5, fh * 1.1);
+      if (hUrl) {
+        const r = await ask(hUrl, H_LABELS);
+        const on = r.top === 0 && r.score > 0.6;
+        if (sHat.push(on)) {
+          wear.hat = on;
+          say(on ? `لابس ${HAT_AR}` : `شلت ${HAT_AR}`);
+        }
+      }
+      // clothes: torso below chin
+      const tw = fw * 2.6, tx = P[152].x - tw / 2, ty = P[152].y + fh * 0.35;
+      const tUrl = crop(tx, ty, tw, fh * 1.8);
+      if (tUrl) {
+        const r = await ask(tUrl, CLOTHES.map(c => c.q));
+        if (r.score > 0.3) {
+          const c = CLOTHES[r.top], col = await avgColor(tUrl);
+          const id = c.en + "|" + col[1];
+          if (sCloth.push(id)) {
+            wear.cloth = c; wear.color = c.en === "shirtless" ? null : col;
+            say(c.en === "shirtless" ? "ما لابس شي" : `لابس ${c.ar} ${col[0]}`);
+          }
+        }
+      }
+      renderWear();
+    } catch (e) { info.textContent = "AI error: " + e.message; await sleep(2000); }
+    await sleep(250);
+  }
+}
+
+async function loadClip() {
+  env.backends.onnx.wasm.proxy = true;       // run in a worker so the video stays smooth
+  clf = await pipeline("zero-shot-image-classification", "Xenova/clip-vit-base-patch32", {
+    dtype: "q8",
+    progress_callback: p => { if (p.status === "progress") info.textContent = `Loading AI model ${Math.round(p.progress)}%`; },
+  });
+  info.textContent = "AI ready";
+}
+
+/* ====================== MediaPipe + main loop ====================== */
+let faceLm, handLm, running = false, lastT = -1;
+let state = "normal", candidate = "normal", streak = 0;
+
+async function initMP() {
+  info.textContent = "Loading face model...";
+  const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  faceLm = await FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO", numFaces: 4, outputFacialTransformationMatrixes: true });
+  handLm = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task", delegate: "GPU" },
+    runningMode: "VIDEO", numHands: 2 });
+}
+
+function drawTracked(P, bb, pose, w, h, label, alert) {
+  const col = alert ? "#ff3b3b" : "#1fd655";
+  const X = x => w - x;                       // mirror x to match the mirrored video
+  const x0 = X(bb.x1), bw = bb.x1 - bb.x0, pad = bw * 0.12;
+  ctx.strokeStyle = col; ctx.lineWidth = 4;
+  ctx.strokeRect(x0 - pad, bb.y0 - pad * 2.2, bw + pad * 2, bb.y1 - bb.y0 + pad * 3.2);
+  ctx.fillStyle = col; ctx.font = "bold 20px ui-monospace, monospace";
+  const tw = ctx.measureText(label).width + 14;
+  ctx.fillRect(x0 - pad, bb.y0 - pad * 2.2 - 28, tw, 28);
+  ctx.fillStyle = "#04210e"; ctx.fillText(label, x0 - pad + 7, bb.y0 - pad * 2.2 - 7);
+  // pose axes at the nose
+  const o = P[1], L = 0.12 * h, cols = ["#ff4040", "#40ff40", "#4090ff"];
+  for (let i = 0; i < 3; i++) {
+    ctx.strokeStyle = cols[i]; ctx.lineWidth = 3; ctx.beginPath();
+    ctx.moveTo(X(o.x * w), o.y * h);
+    ctx.lineTo(X(o.x * w) - pose.R(0, i) * L, o.y * h - pose.R(1, i) * L); ctx.stroke();
+  }
+  ctx.fillStyle = "#b6ff3c";
+  for (const i of [33, 263, 61, 291, 13, 14, 1, 152]) { ctx.beginPath(); ctx.arc(X(P[i].x * w), P[i].y * h, 3, 0, 7); ctx.fill(); }
+}
+
+function loop() {
+  if (!running) return;
+  if (video.readyState >= 2 && video.currentTime !== lastT) {
+    lastT = video.currentTime;
+    const w = canvas.width = video.videoWidth, h = canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, w, h);
+    const now = performance.now();
+    const fr = faceLm.detectForVideo(video, now), hr = handLm.detectForVideo(video, now);
+
+    // pick ONE face: the biggest one
+    let best = -1, bestA = 0;
+    fr.faceLandmarks.forEach((L, i) => { const b = bboxOf(L, w, h), a = (b.x1 - b.x0) * (b.y1 - b.y0); if (a > bestA) { bestA = a; best = i; } });
+
+    if (best >= 0 && fr.facialTransformationMatrixes[best]) {
+      const P = fr.faceLandmarks[best].map(p => ({ x: p.x * w, y: p.y * h }));
+      const bb = bboxOf(fr.faceLandmarks[best], w, h);
+      const pose = headPose(fr.facialTransformationMatrixes[best].data);
+      const Hp = hr.landmarks.map(hand => hand.map(p => ({ x: p.x * w, y: p.y * h })));
+      latest = { P, fw: dist(P[234], P[454]), fh: dist(P[10], P[152]) };
+
+      const next = classifyFace(P, Hp, pose.yaw);
+      streak = next === candidate ? streak + 1 : 1; candidate = next;
+      if (streak >= 3) state = candidate;
+
+      finalKey = state !== "normal" ? state : wear.hat ? "hat" : wear.glasses ? "glasses" : "normal";
+      showState(finalKey);
+      drawTracked(P, bb, pose, w, h, "TARGET · " + STATES[finalKey][0], STATES[finalKey][1]);
+      info.textContent = clf ? `pitch ${pose.pitch.toFixed(0)} yaw ${pose.yaw.toFixed(0)} roll ${pose.roll.toFixed(0)}` : info.textContent;
+    } else latest = null;
+  }
+  requestAnimationFrame(loop);
+}
+
+$("start").onclick = async () => {
+  try {
+    $("start").disabled = true;
+    // unlock speech from this tap
+    if ("speechSynthesis" in window) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); }
+    if (!faceLm) await initMP();
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 960 }, height: { ideal: 720 } }, audio: false });
+    await video.play();
+    $("start").textContent = "Running";
+    running = true; loop();
+    renderWear();
+    loadClip().then(accessoryLoop).catch(e => { info.textContent = "AI model failed: " + e.message + " (face states still work)"; });
+  } catch (e) { $("start").disabled = false; info.textContent = "Error: " + e.message; }
+};
+showState("normal"); renderWear();
+</script>
+</body>
+</html>
